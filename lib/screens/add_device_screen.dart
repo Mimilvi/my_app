@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../services/ble_service.dart';
+import '../services/provisioning_service.dart';
+
 
 class AddDeviceScreen extends StatefulWidget {
   const AddDeviceScreen({super.key});
@@ -12,8 +14,10 @@ class AddDeviceScreen extends StatefulWidget {
 
 class _AddDeviceScreenState extends State<AddDeviceScreen> {
   final _ble = BleService();
+  final _prov = ProvisioningService();
 
   BluetoothDevice? _connectedDevice;
+  bool _busy = false;
 
   @override
   void initState() {
@@ -22,7 +26,6 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
   }
 
   Future<void> _requestPermissionsAndScan() async {
-    // Запрашиваем разрешения на Bluetooth и геолокацию
     final permissions = await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
@@ -31,14 +34,13 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
 
     final allGranted = permissions.values.every((p) => p.isGranted);
     if (!allGranted) {
-      _showMessage('Разрешения не предоставлены. BLE не будет работать.');
+      _showMessage('Разрешения не предоставлены');
       return;
     }
 
-    // Проверяем, включён ли Bluetooth
     final state = await FlutterBluePlus.adapterState.first;
     if (state != BluetoothAdapterState.on) {
-      _showMessage('Включите Bluetooth на устройстве');
+      _showMessage('Включите Bluetooth');
       return;
     }
 
@@ -52,24 +54,133 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
     );
   }
 
-  Future<void> _connectTo(BluetoothDevice device) async {
+  Future<void> _connectAndProvision(BluetoothDevice device) async {
+    setState(() => _busy = true);
     try {
       _showMessage('Подключение к ${device.platformName}...');
       await _ble.connect(device);
-      setState(() => _connectedDevice = device);
-      _showMessage('Подключено!');
+      await _ble.stopScan();
+
+      _showMessage('Установка BLE-сессии...');
+      await _prov.createSession(device: device);
+
+      _showMessage('Получение списка Wi-Fi сетей...');
+      final networks = await _prov.scanWifiNetworks();
+
+      if (!mounted) return;
+      setState(() => _busy = false);
+
+      if (networks.isEmpty) {
+        _showMessage('ESP32 не видит Wi-Fi сетей');
+        await _cleanup();
+        return;
+      }
+
+      // Показываем диалог выбора сети
+      _showWifiDialog(networks);
     } catch (e) {
-      _showMessage('Ошибка подключения: $e');
+      setState(() => _busy = false);
+      _showMessage('Ошибка: $e');
+      await _cleanup();
     }
   }
 
-  Future<void> _disconnect() async {
-    final device = _connectedDevice;
-    if (device == null) return;
+  void _showWifiDialog(List<String> networks) {
+    String? selected = networks.first;
+    final passwordController = TextEditingController();
 
-    await _ble.disconnect(device);
-    setState(() => _connectedDevice = null);
-    _showMessage('Отключено');
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Подключение к Wi-Fi'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  DropdownButtonFormField<String>(
+                    value: selected,
+                    decoration: const InputDecoration(
+                      labelText: 'Wi-Fi сеть',
+                      border: OutlineInputBorder(),
+                    ),
+                    items: networks
+                        .map((n) => DropdownMenuItem(value: n, child: Text(n)))
+                        .toList(),
+                    onChanged: (v) {
+                      if (v != null) setDialogState(() => selected = v);
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: passwordController,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Пароль',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () async {
+                    Navigator.pop(context);
+                    await _cleanup();
+                  },
+                  child: const Text('Отмена'),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    if (selected == null) return;
+                    Navigator.pop(context);
+                    await _sendCredentials(
+                      selected!,
+                      passwordController.text,
+                    );
+                  },
+                  child: const Text('Подключить'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _sendCredentials(String ssid, String password) async {
+    setState(() => _busy = true);
+    try {
+      _showMessage('Отправка данных на колонку...');
+      await _prov.sendWifiCredentials(ssid: ssid, password: password);
+
+      _showMessage('Ожидание подключения колонки к Wi-Fi...');
+      final ok = await _prov.applyWifiConfig();
+
+      if (ok) {
+        _showMessage('✅ Колонка успешно подключена к Wi-Fi!');
+      } else {
+        _showMessage('❌ Не удалось подключить колонку');
+      }
+    } catch (e) {
+      _showMessage('Ошибка: $e');
+    } finally {
+      setState(() => _busy = false);
+      await _cleanup();
+    }
+  }
+
+  Future<void> _cleanup() async {
+    try {
+      await _prov.disconnect();
+      if (_connectedDevice != null) {
+        await _ble.disconnect(_connectedDevice!);
+      }
+    } catch (_) {}
+    if (mounted) setState(() => _connectedDevice = null);
   }
 
   @override
@@ -80,13 +191,12 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: () => _ble.startScan(),
+            onPressed: _busy ? null : () => _ble.startScan(),
           ),
         ],
       ),
       body: Column(
         children: [
-          // Информационная плашка
           Container(
             width: double.infinity,
             color: Colors.blue.shade50,
@@ -98,7 +208,12 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
             ),
           ),
 
-          // Индикатор сканирования
+          if (_busy)
+            const Padding(
+              padding: EdgeInsets.all(12),
+              child: LinearProgressIndicator(),
+            ),
+
           StreamBuilder<bool>(
             stream: _ble.isScanning,
             builder: (context, snapshot) {
@@ -125,7 +240,6 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
 
           const Divider(height: 1),
 
-          // Список найденных устройств
           Expanded(
             child: StreamBuilder<List<ScanResult>>(
               stream: _ble.scanResults,
@@ -134,7 +248,7 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
                 if (results.isEmpty) {
                   return const Center(
                     child: Text(
-                      'Устройства не найдены.\nНажмите 🔄 вверху, чтобы повторить.',
+                      'Устройства не найдены.\nНажмите 🔄 вверху.',
                       textAlign: TextAlign.center,
                     ),
                   );
@@ -148,47 +262,18 @@ class _AddDeviceScreenState extends State<AddDeviceScreen> {
                     final name = device.platformName.isNotEmpty
                         ? device.platformName
                         : '(без имени)';
-                    final isConnected = _connectedDevice?.remoteId == device.remoteId;
-
                     return ListTile(
-                      leading: Icon(
-                        isConnected ? Icons.bluetooth_connected : Icons.bluetooth,
-                        color: isConnected ? Colors.green : null,
-                      ),
+                      leading: const Icon(Icons.bluetooth),
                       title: Text(name),
-                      subtitle: Text(
-                        '${device.remoteId} • сигнал: ${r.rssi} dBm',
-                      ),
-                      trailing: isConnected
-                          ? TextButton(
-                              onPressed: _disconnect,
-                              child: const Text('Отключить'),
-                            )
-                          : const Icon(Icons.chevron_right),
-                      onTap: isConnected ? null : () => _connectTo(device),
+                      subtitle: Text('${device.remoteId} • ${r.rssi} dBm'),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: _busy ? null : () => _connectAndProvision(device),
                     );
                   },
                 );
               },
             ),
           ),
-
-          // Кнопка «Продолжить», если подключено
-          if (_connectedDevice != null)
-            Padding(
-              padding: const EdgeInsets.all(12.0),
-              child: SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  icon: const Icon(Icons.wifi),
-                  label: const Text('Передать Wi-Fi'),
-                  onPressed: () {
-                    _showMessage('Следующий шаг: передача Wi-Fi через BLE');
-                    // Позже здесь будет реальная логика esp_provisioning_ble
-                  },
-                ),
-              ),
-            ),
         ],
       ),
     );
